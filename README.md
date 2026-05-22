@@ -99,6 +99,190 @@ pnpm run clean
 type ExchangeTopics = "fanout" | "direct" | "topic" | "headers";
 ```
 
+RabbitMQ routes messages from an exchange to queues based on the exchange type:
+
+#### `fanout` — Broadcast to all bound queues
+
+Ignores routing key entirely. Every bound queue gets a copy of the message.
+
+```
+Producer → [fanout exchange] → Queue A (gets message)
+                              → Queue B (gets message)
+                              → Queue C (gets message)
+```
+
+**Use case:** Notifications, event broadcasting, cache invalidation across all services.
+
+```typescript
+class BroadcastExchange extends RabbitMqQueueExchange {
+  constructor() {
+    super("events.broadcast", "fanout");
+  }
+
+  async setup(rabbit: RabbitMqBaseClass) {
+    await this.startChannelization(rabbit);
+    await this.createExchange();
+    // Routing key is ignored — just bind with ""
+    await this.createQueue("service-a.events", "");
+    await this.createQueue("service-b.events", "");
+    await this.createQueue("service-c.events", "");
+  }
+}
+
+// All 3 queues receive this message regardless of routing key
+const producer = new RabbitProducerExchanger(
+  "events.broadcast",
+  { event: "cache.invalidate", key: "user:42" },
+  "this.is.ignored" // routing key doesn't matter for fanout
+);
+```
+
+---
+
+#### `direct` — Exact routing key match
+
+Message goes only to queues whose binding key exactly matches the message's routing key.
+
+```
+Producer (key="error") → [direct exchange] → Queue A (bound: "error")  ✓ gets it
+                                            → Queue B (bound: "info")   ✗ skipped
+                                            → Queue C (bound: "error")  ✓ gets it
+```
+
+**Use case:** Log levels, task routing to specific workers, status-based routing.
+
+```typescript
+class LogExchange extends RabbitMqQueueExchange {
+  constructor() {
+    super("logs", "direct");
+  }
+
+  async setup(rabbit: RabbitMqBaseClass) {
+    await this.startChannelization(rabbit);
+    await this.createExchange();
+    await this.createQueue("logs.errors", "error");     // only errors
+    await this.createQueue("logs.warnings", "warning"); // only warnings
+    await this.createQueue("logs.all", "info");         // only info
+  }
+}
+
+// Only "logs.errors" queue receives this
+const producer = new RabbitProducerExchanger(
+  "logs",
+  { msg: "DB connection failed" },
+  "error" // exact match against binding key
+);
+```
+
+---
+
+#### `topic` — Pattern-based routing key match
+
+Routing key is a dot-separated string. Binding keys support wildcards:
+- `*` — matches exactly one word
+- `#` — matches zero or more words
+
+```
+Routing key: "order.created.us"
+
+  Binding "order.created.*"   → ✓ matches (one word after "order.created.")
+  Binding "order.#"           → ✓ matches (zero or more words after "order.")
+  Binding "order.created.eu"  → ✗ no match ("us" ≠ "eu")
+  Binding "*.created.*"       → ✓ matches (any.created.any)
+```
+
+**Use case:** Event-driven microservices, geo-based routing, multi-tenant systems.
+
+```typescript
+class OrderExchange extends RabbitMqQueueExchange {
+  constructor() {
+    super("orders", "topic");
+  }
+
+  async setup(rabbit: RabbitMqBaseClass) {
+    await this.startChannelization(rabbit);
+    await this.createExchange();
+    await this.createQueue("orders.all", "order.#");            // ALL order events
+    await this.createQueue("orders.created", "order.created.*"); // order.created.{region}
+    await this.createQueue("orders.us", "order.*.us");           // any order event from US
+  }
+}
+
+// "orders.all" and "orders.created" receive this, "orders.us" receives it too
+const producer = new RabbitProducerExchanger(
+  "orders",
+  { orderId: "ORD-1", region: "us" },
+  "order.created.us"
+);
+```
+
+---
+
+#### `headers` — Route by message headers (not routing key)
+
+Routing key is completely ignored. Instead, message headers are matched against binding arguments.
+
+- `x-match: "all"` — ALL specified headers must match
+- `x-match: "any"` — ANY one header matching is enough
+
+```
+Message headers: { type: "error", severity: "critical" }
+
+  Binding { x-match: "all", type: "error", severity: "critical" }  → ✓ both match
+  Binding { x-match: "all", type: "error", severity: "warning" }   → ✗ severity doesn't match
+  Binding { x-match: "any", type: "info", severity: "critical" }   → ✓ severity matches
+```
+
+**Use case:** Complex routing logic that can't be expressed as a string pattern, multi-attribute filtering.
+
+```typescript
+class AlertExchange extends RabbitMqQueueExchange {
+  constructor() {
+    super("alerts", "headers");
+  }
+
+  async setup(rabbit: RabbitMqBaseClass) {
+    await this.startChannelization(rabbit);
+    await this.createExchange();
+
+    // Only receives messages where BOTH headers match
+    await this.createQueue("alerts.critical-errors", "", { durable: true }, undefined, {
+      "x-match": "all",
+      "type": "error",
+      "severity": "critical",
+    });
+
+    // Receives messages where ANY header matches
+    await this.createQueue("alerts.any-error", "", { durable: true }, undefined, {
+      "x-match": "any",
+      "type": "error",
+      "severity": "critical",
+    });
+  }
+}
+
+// Both queues receive this (all headers match)
+const producer = new RabbitProducerExchanger(
+  "alerts",
+  { message: "Disk full" },
+  "" // routing key ignored
+);
+await producer.produceMessage(rabbit, {
+  headers: { type: "error", severity: "critical" },
+});
+```
+
+---
+
+#### Quick Comparison
+
+| Type | Routes by | Wildcards | Use case |
+|------|-----------|-----------|----------|
+| `fanout` | Nothing (broadcast) | N/A | Notify all services |
+| `direct` | Exact routing key | No | Log levels, task types |
+| `topic` | Pattern routing key | `*` and `#` | Event-driven microservices |
+| `headers` | Message headers | `x-match` all/any | Complex multi-attribute routing |
+
 ---
 
 ### RabbitConnectionOptions
