@@ -7,7 +7,7 @@
  * - Channels have error/close handlers attached automatically
  */
 
-import { RabbitMqBaseClass } from "../Correct/Rabbit.singleton.correct";
+import { RabbitMqBaseClass } from "../src/connection";
 
 async function main() {
   const rabbit = new RabbitMqBaseClass("amqp://localhost");
