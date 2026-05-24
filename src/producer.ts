@@ -5,6 +5,8 @@ import type { PublishOptions } from "./types.js";
 export class RabbitProducer {
   private exchangeName: string;
   private routingKey: string;
+  private channel: amqp.Channel | null = null;
+  private confirmChannel: amqp.ConfirmChannel | null = null;
 
   public constructor(exchangeName: string, routingKey: string = "") {
     this.exchangeName = exchangeName;
@@ -25,22 +27,38 @@ export class RabbitProducer {
     };
   }
 
+  private async getChannel(rabbitBaseInstance: RabbitMqBaseClass) {
+    if (!this.channel) {
+      this.channel = await rabbitBaseInstance.createChannel();
+      this.channel.on("close", () => {
+        this.channel = null;
+      });
+    }
+    return this.channel;
+  }
+
+  private async getConfirmChannel(rabbitBaseInstance: RabbitMqBaseClass) {
+    if (!this.confirmChannel) {
+      this.confirmChannel = await rabbitBaseInstance.createConfirmChannel();
+      this.confirmChannel.on("close", () => {
+        this.confirmChannel = null;
+      });
+    }
+    return this.confirmChannel;
+  }
+
   public async publish(
     rabbitBaseInstance: RabbitMqBaseClass,
     data: Record<string, any>,
     options: PublishOptions = {}
   ) {
-    const channel = await rabbitBaseInstance.createChannel();
-    try {
-      channel.publish(
-        this.exchangeName,
-        this.routingKey,
-        Buffer.from(JSON.stringify(data)),
-        this.buildPublishOpts(options)
-      );
-    } finally {
-      await channel.close();
-    }
+    const channel = await this.getChannel(rabbitBaseInstance);
+    channel.publish(
+      this.exchangeName,
+      this.routingKey,
+      Buffer.from(JSON.stringify(data)),
+      this.buildPublishOpts(options)
+    );
   }
 
   public async publishWithConfirm(
@@ -48,7 +66,7 @@ export class RabbitProducer {
     data: Record<string, any>,
     options: PublishOptions = {}
   ): Promise<boolean> {
-    const channel = await rabbitBaseInstance.createConfirmChannel();
+    const channel = await this.getConfirmChannel(rabbitBaseInstance);
 
     channel.publish(
       this.exchangeName,
@@ -59,11 +77,20 @@ export class RabbitProducer {
 
     try {
       await channel.waitForConfirms();
-      await channel.close();
       return true;
     } catch {
-      await channel.close();
       return false;
+    }
+  }
+
+  public async close() {
+    if (this.channel) {
+      await this.channel.close();
+      this.channel = null;
+    }
+    if (this.confirmChannel) {
+      await this.confirmChannel.close();
+      this.confirmChannel = null;
     }
   }
 }
